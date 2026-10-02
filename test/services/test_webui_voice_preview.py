@@ -36,7 +36,7 @@ def _load_duration_estimator():
     return namespace["_estimate_voiceover_duration_range"]
 
 
-def _load_provider_signature(test_config):
+def _load_provider_signature(test_config, session_state=None):
     """加载凭证摘要和 Provider 指纹函数，独立验证缓存失效规则。"""
     tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
     functions = [
@@ -46,13 +46,102 @@ def _load_provider_signature(test_config):
         and node.name
         in {
             "_credential_signature",
+            "_get_voxcpm_reference_audio_digest",
+            "_get_voxcpm_prompt_audio_digest",
+            "_get_voxcpm_prompt_text",
+            "_get_voxcpm_effective_prompt_audio_digest",
             "_get_voice_preview_provider_signature",
         }
     ]
     module = ast.Module(body=functions, type_ignores=[])
-    namespace = {"hashlib": hashlib, "config": test_config}
+    namespace = {
+        "hashlib": hashlib,
+        "config": test_config,
+        "st": SimpleNamespace(
+            session_state={} if session_state is None else session_state
+        ),
+        "VOXCPM_REFERENCE_AUDIO_SESSION_KEY": "voxcpm_reference_audio",
+        "VOXCPM_PROMPT_AUDIO_SESSION_KEY": "voxcpm_prompt_audio",
+        "VOXCPM_PROMPT_TEXT_SESSION_KEY": "voxcpm_prompt_text_input",
+        "VOXCPM_HIGH_FIDELITY_SESSION_KEY": "voxcpm_high_fidelity_enabled",
+        "VOXCPM_SEPARATE_PROMPT_AUDIO_SESSION_KEY": (
+            "voxcpm_separate_prompt_audio_enabled"
+        ),
+    }
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
     return namespace["_get_voice_preview_provider_signature"]
+
+
+def _load_voxcpm_state_helpers(session_state):
+    """Load upload-state helpers without executing the full Streamlit app."""
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    function_names = {
+        "_get_voxcpm_reference_audio",
+        "_get_voxcpm_reference_audio_digest",
+        "_get_voxcpm_prompt_audio",
+        "_get_voxcpm_prompt_audio_digest",
+        "_get_voxcpm_prompt_text",
+        "_clear_voxcpm_separate_prompt_audio",
+        "_clear_voxcpm_prompt_state",
+        "_clear_voxcpm_prompt_transcript",
+        "_sync_voxcpm_prompt_example_mode",
+        "_get_voxcpm_effective_prompt_audio",
+        "_get_voxcpm_effective_prompt_audio_digest",
+        "_get_voxcpm_prompt_validation_error",
+        "_get_voxcpm_preview_validation_error",
+        "_sync_voxcpm_reference_audio",
+        "_sync_voxcpm_prompt_audio",
+    }
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in function_names
+    ]
+    module = ast.Module(body=functions, type_ignores=[])
+    namespace = {
+        "Path": Path,
+        "hashlib": hashlib,
+        "st": SimpleNamespace(
+            session_state=session_state,
+            spinner=lambda _label: nullcontext(),
+        ),
+        "tr": lambda key: key,
+        "voice": SimpleNamespace(
+            VOXCPM_REFERENCE_AUDIO_MAX_UPLOAD_BYTES=1024,
+            prepare_voxcpm_reference_audio=lambda audio, _suffix: audio,
+            is_voxcpm_voice=lambda name: str(name or "").startswith("voxcpm:"),
+        ),
+        "VOXCPM_REFERENCE_AUDIO_SESSION_KEY": "voxcpm_reference_audio",
+        "VOXCPM_REFERENCE_AUDIO_ERROR_SESSION_KEY": "voxcpm_reference_audio_error",
+        "VOXCPM_PROMPT_AUDIO_SESSION_KEY": "voxcpm_prompt_audio",
+        "VOXCPM_PROMPT_AUDIO_ERROR_SESSION_KEY": "voxcpm_prompt_audio_error",
+        "VOXCPM_PROMPT_TEXT_SESSION_KEY": "voxcpm_prompt_text_input",
+        "VOXCPM_HIGH_FIDELITY_SESSION_KEY": "voxcpm_high_fidelity_enabled",
+        "VOXCPM_SEPARATE_PROMPT_AUDIO_SESSION_KEY": (
+            "voxcpm_separate_prompt_audio_enabled"
+        ),
+        "VOXCPM_PROMPT_EXAMPLE_MODE_SESSION_KEY": "voxcpm_prompt_example_mode",
+    }
+    exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
+    return namespace
+
+
+class _FakeAudioUpload:
+    def __init__(self, name: str, payload: bytes):
+        self.name = name
+        self.size = len(payload)
+        self._payload = payload
+
+    def getvalue(self):
+        return self._payload
+
+
+def _session_audio(payload: bytes) -> dict:
+    return {
+        "audio_bytes": payload,
+        "audio_digest": hashlib.sha256(payload).hexdigest(),
+        "upload_digest": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def _button_by_key(app, key):
@@ -91,6 +180,12 @@ def test_provider_signature_changes_when_api_key_changes():
             "base_url": "http://127.0.0.1:4123/v1",
             "model_id": "chatterbox",
         },
+        voxcpm={
+            "api_key": "old-voxcpm",
+            "base_url": "https://api.modelbest.cn/v1",
+            "model_id": "speech-model",
+            "voice_id": "default",
+        },
     )
     provider_signature = _load_provider_signature(test_config)
 
@@ -101,6 +196,106 @@ def test_provider_signature_changes_when_api_key_changes():
     assert old_signature != new_signature
     assert "old-elevenlabs" not in str(old_signature)
     assert "new-elevenlabs" not in str(new_signature)
+
+
+def test_voxcpm_preview_signature_tracks_endpoint_model_and_credentials():
+    session_state = {}
+    test_config = SimpleNamespace(
+        app={}, azure={}, siliconflow={}, elevenlabs={}, chatterbox={}, kokoro={},
+        voxcpm={
+            "api_key": "old-key",
+            "base_url": "https://api.modelbest.cn/v1",
+            "model_id": "speech-model-a",
+            "voice_id": "default",
+        },
+    )
+    provider_signature = _load_provider_signature(test_config, session_state)
+
+    original = provider_signature("voxcpm")
+    test_config.voxcpm["model_id"] = "speech-model-b"
+    changed_model = provider_signature("voxcpm")
+    test_config.voxcpm["api_key"] = "new-key"
+    changed_key = provider_signature("voxcpm")
+    session_state["voxcpm_reference_audio"] = {"audio_digest": "new-reference"}
+    changed_reference = provider_signature("voxcpm")
+    session_state["voxcpm_high_fidelity_enabled"] = True
+    session_state["voxcpm_prompt_text_input"] = "delivery transcript"
+    reused_reference_as_prompt = provider_signature("voxcpm")
+    session_state["voxcpm_separate_prompt_audio_enabled"] = True
+    session_state["voxcpm_prompt_audio"] = {"audio_digest": "new-prompt"}
+    changed_prompt = provider_signature("voxcpm")
+
+    assert original != changed_model != changed_key != changed_reference
+    assert changed_reference != reused_reference_as_prompt != changed_prompt
+    assert "old-key" not in str(original)
+    assert "new-key" not in str(changed_key)
+
+
+def test_replacing_shared_reference_clears_its_transcript():
+    session_state = {
+        "voxcpm_reference_audio": _session_audio(b"clip-a"),
+        "voxcpm_high_fidelity_enabled": True,
+        "voxcpm_separate_prompt_audio_enabled": False,
+        "voxcpm_prompt_text_input": "clip A transcript",
+    }
+    helpers = _load_voxcpm_state_helpers(session_state)
+
+    helpers["_sync_voxcpm_reference_audio"](
+        _FakeAudioUpload("clip-b.wav", b"clip-b")
+    )
+
+    assert "voxcpm_prompt_text_input" not in session_state
+
+
+def test_replacing_separate_delivery_audio_clears_transcript_but_not_identity_change():
+    session_state = {
+        "voxcpm_reference_audio": _session_audio(b"identity-a"),
+        "voxcpm_prompt_audio": _session_audio(b"delivery-a"),
+        "voxcpm_high_fidelity_enabled": True,
+        "voxcpm_separate_prompt_audio_enabled": True,
+        "voxcpm_prompt_text_input": "delivery A transcript",
+    }
+    helpers = _load_voxcpm_state_helpers(session_state)
+
+    helpers["_sync_voxcpm_reference_audio"](
+        _FakeAudioUpload("identity-b.wav", b"identity-b")
+    )
+    assert session_state["voxcpm_prompt_text_input"] == "delivery A transcript"
+
+    helpers["_sync_voxcpm_prompt_audio"](
+        _FakeAudioUpload("delivery-b.wav", b"delivery-b")
+    )
+    assert "voxcpm_prompt_text_input" not in session_state
+
+
+def test_switching_prompt_example_modes_clears_transcript():
+    session_state = {
+        "voxcpm_prompt_example_mode": False,
+        "voxcpm_prompt_text_input": "shared transcript",
+    }
+    helpers = _load_voxcpm_state_helpers(session_state)
+
+    helpers["_sync_voxcpm_prompt_example_mode"](True)
+
+    assert "voxcpm_prompt_text_input" not in session_state
+
+
+def test_invalid_reference_upload_blocks_voxcpm_preview_only():
+    session_state = {"voxcpm_reference_audio_error": "invalid WAV"}
+    helpers = _load_voxcpm_state_helpers(session_state)
+
+    assert (
+        helpers["_get_voxcpm_preview_validation_error"](
+            "voxcpm", "voxcpm:default"
+        )
+        == "invalid WAV"
+    )
+    assert (
+        helpers["_get_voxcpm_preview_validation_error"](
+            "azure-tts-v1", "zh-CN-XiaoxiaoNeural-Female"
+        )
+        == ""
+    )
 
 
 def test_full_voiceover_preview_is_disabled_until_script_exists():
@@ -156,6 +351,46 @@ def test_script_shows_estimate_and_enables_full_voiceover_preview():
     assert [str(item.value) for item in app.exception] == []
 
 
+def test_short_preview_autoplays_only_after_explicit_click_and_reuses_cache():
+    """短试听应立即播放；普通 rerun 不重播，重复点击也不重复调用 TTS。"""
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="zh-CN-XiaoxiaoNeural-Female",
+    )
+
+    def fake_tts(**kwargs):
+        Path(kwargs["voice_file"]).write_bytes(
+            b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 32
+        )
+        return object()
+
+    with (
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "save_config"),
+        patch.object(voice, "tts", side_effect=fake_tts) as synthesize,
+        patch.object(voice, "get_audio_duration", return_value=3.0),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "zh"
+        app.run()
+
+        _button_by_key(app, "play_voice_button").click().run()
+        assert len(app.get("audio")) == 1
+        assert app.get("audio")[0].proto.autoplay
+
+        app.run()
+        assert len(app.get("audio")) == 1
+        assert not app.get("audio")[0].proto.autoplay
+
+        _button_by_key(app, "play_voice_button").click().run()
+
+    synthesize.assert_called_once()
+    assert app.get("audio")[0].proto.autoplay
+    assert [str(item.value) for item in app.exception] == []
+
+
 def test_full_preview_uses_script_and_reuses_identical_cached_audio():
     """完整试听使用当前文案，相同参数重复点击时不得再次调用 TTS。"""
     script = "这是一段用于验证完整配音预览缓存的测试文案。"
@@ -197,6 +432,7 @@ def test_full_preview_uses_script_and_reuses_identical_cached_audio():
     synthesize.assert_called_once()
     assert synthesize.call_args.kwargs["text"] == script
     assert len(app.get("audio")) == 1
+    assert not app.get("audio")[0].proto.autoplay
     assert any("实际配音时长：12.3 秒" in item.value for item in app.caption)
     assert [str(item.value) for item in app.exception] == []
 

@@ -1,6 +1,11 @@
 import json
 import logging
+import math
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from time import perf_counter
 from typing import List
 
@@ -10,6 +15,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -43,6 +49,115 @@ Generate a script for a video, depending on the subject of the video.
 8. respond in the same language as the video subject.
 """.strip()
 
+# Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
+# 无关，会让脚本和关键词生成偏离要求，因此调用时整体替换掉。
+CLAUDE_CODE_SYSTEM_PROMPT = (
+    "You are a concise copywriter. Follow the user's instructions and output "
+    "format exactly, and output nothing else."
+)
+CLAUDE_CODE_DEFAULT_TIMEOUT = 300.0
+# `--tools ""` 关闭全部内置工具，`--safe-mode` 关闭 CLAUDE.md、skills、hooks、
+# plugins、MCP 等所有用户级定制，同时保持鉴权、模型选择和权限正常工作。
+# 二者需要较新的 CLI；低版本会以 "unknown option" 退出，由调用处转成明确提示。
+CLAUDE_CODE_MIN_CLI_VERSION = "2.1.260"
+# 这些环境变量会让 CLI 改用 API Key 或第三方供应商（Bedrock、Vertex、Foundry、
+# Mantle、Gateway 等），从而绕过订阅登录并产生额外计费。逐个列举容易漏项，
+# 而且 CLI 后续还会新增供应商，因此按前缀整类剔除：
+#   ANTHROPIC_*           API Key、Auth Token、Base URL、各家供应商端点和 Profile
+#   CLAUDE_CODE_USE_*     供应商开关
+#   CLAUDE_CODE_SKIP_*_AUTH  跳过供应商鉴权的开关
+CLAUDE_CODE_CONFLICTING_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+CLAUDE_CODE_CONFLICTING_ENV_VARS = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+)
+# 这两类变量不能剔除：
+#   CLAUDE_CODE_OAUTH_TOKEN 是容器内唯一的订阅鉴权方式（不匹配上面的前缀）；
+#   *_CONFIG_DIR 只是指出凭证存放位置，剔除后反而会让已登录的订阅失效。
+CLAUDE_CODE_PRESERVED_ENV_VARS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_CONFIG_DIR",
+    "CLAUDE_CONFIG_DIR",
+)
+
+
+def _is_conflicting_claude_code_env(name: str) -> bool:
+    """判断某个环境变量是否会把 CLI 从订阅登录切换到别的鉴权方式。"""
+    if name in CLAUDE_CODE_PRESERVED_ENV_VARS:
+        return False
+    if name in CLAUDE_CODE_CONFLICTING_ENV_VARS:
+        return True
+    if name.startswith(CLAUDE_CODE_CONFLICTING_ENV_PREFIXES):
+        return True
+    return name.startswith("CLAUDE_CODE_SKIP_") and name.endswith("_AUTH")
+
+
+def coerce_claude_code_timeout(value, config_key: str = "claude_code_timeout"):
+    """
+    把配置里的超时值解析成正的有限秒数。
+
+    TOML 既可能写成 `claude_code_timeout = 300`（int/float），也可能写成
+    `"300"`（字符串），因此不能直接调用 `strip()`。nan / inf 会让
+    `subprocess.run(timeout=...)` 永久阻塞，这里一并拒绝。
+    """
+    if value is None:
+        return CLAUDE_CODE_DEFAULT_TIMEOUT
+
+    if isinstance(value, bool):
+        # bool 是 int 的子类，但 True 秒显然不是用户想要的超时配置。
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return CLAUDE_CODE_DEFAULT_TIMEOUT
+        try:
+            seconds = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{config_key} must be a number of seconds, got {value!r}"
+            ) from None
+    elif isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if not math.isfinite(seconds):
+        raise ValueError(f"{config_key} must be a finite number, got {value!r}")
+    if seconds <= 0:
+        raise ValueError(f"{config_key} must be greater than 0, got {value!r}")
+    return seconds
+
+
+def _resolve_provider_field_value(raw_value, default_value):
+    """
+    只有「未配置」时才回退到 Registry 默认值。
+
+    之前用 `raw or default_value`，会把 0 和 false 这类合法取值也当成未配置
+    替换掉：`claude_code_timeout = 0` 被静默改成 300，而 `"0"` 却报错。默认值
+    只在 None 或空白字符串时生效，配置校验才能对所有写法保持一致。
+    """
+    if raw_value is None:
+        return default_value
+    if isinstance(raw_value, str) and not raw_value.strip():
+        return default_value
+    return raw_value
+
+
+def build_claude_code_env(base_env=None):
+    """
+    构造只依赖订阅登录的子进程环境。
+
+    返回 (环境变量字典, 被剔除的变量名列表)。剔除的是会切换鉴权方式或供应商
+    的变量，`CLAUDE_CODE_OAUTH_TOKEN` 必须保留：容器内没有 keychain，CLI 只能
+    靠它完成订阅鉴权。
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    removed = sorted(name for name in env if _is_conflicting_claude_code_env(name))
+    for name in removed:
+        env.pop(name, None)
+    return env, removed
+
 
 def _normalize_text_response(content, llm_provider: str) -> str:
     # 不同 LLM SDK 在异常或被拦截场景下，可能返回 None、空字符串，
@@ -64,7 +179,9 @@ def _normalize_text_response(content, llm_provider: str) -> str:
     if not content:
         raise ValueError(f"[{llm_provider}] returned empty text content")
 
-    return content.replace("\n", "")
+    # 前面的 ``strip()`` 已经清理首尾空白。这里必须保留正文中的单换行和
+    # 双换行：脚本生成依赖双换行区分段落，字幕处理也会按行读取用户文案。
+    return content
 
 
 def _sanitize_error_message(error: object) -> str:
@@ -137,25 +254,33 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(prompt: str, app_config=None) -> str:
+    sdk_client = None
+    sdk_stream = None
     try:
+        # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
+        # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
+        # 而切换到另一个 Provider、Base URL 或模型。
+        runtime_app_config = app_config if app_config is not None else config.app
         llm_provider = str(
-            config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
+            runtime_app_config.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
         ).lower()
         provider = get_llm_provider(llm_provider)
         if provider is None:
             raise ValueError(f"{llm_provider}: unsupported llm provider")
 
         logger.info(f"llm provider: {llm_provider}")
-        api_key = config.app.get(provider.config_key("api_key"), "")
-        configured_model = config.app.get(provider.config_key("model_name"), "")
+        api_key = runtime_app_config.get(provider.config_key("api_key"), "")
+        configured_model = runtime_app_config.get(provider.config_key("model_name"), "")
         model_name = provider.resolve_model_name(configured_model)
         if configured_model and model_name != configured_model:
             logger.warning(
                 f"{llm_provider} model '{configured_model}' is deprecated, "
                 f"fallback to '{model_name}'"
             )
-        configured_base_url = config.app.get(provider.config_key("base_url"), "")
+        configured_base_url = runtime_app_config.get(
+            provider.config_key("base_url"), ""
+        )
         base_url = provider.resolve_base_url(configured_base_url)
         if configured_base_url and configured_base_url.strip().rstrip("/") in {
             url.rstrip("/") for url in provider.deprecated_base_urls
@@ -175,14 +300,14 @@ def _generate_response(prompt: str) -> str:
                 base_url = config.get_default_ollama_base_url()
 
         if adapter == "azure":
-            api_version = config.app.get(
+            api_version = runtime_app_config.get(
                 provider.config_key("api_version"), "2024-02-15-preview"
             )
 
         extra_values = {
-            field.config_suffix: (
-                config.app.get(provider.config_key(field.config_suffix), "")
-                or field.default_value
+            field.config_suffix: _resolve_provider_field_value(
+                runtime_app_config.get(provider.config_key(field.config_suffix)),
+                field.default_value,
             )
             for field in provider.extra_fields
         }
@@ -211,9 +336,10 @@ def _generate_response(prompt: str) -> str:
             import dashscope
             from dashscope.api_entities.dashscope_response import GenerationResponse
 
-            dashscope.api_key = api_key
             response = dashscope.Generation.call(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                api_key=api_key,
             )
             if response:
                 if isinstance(response, GenerationResponse):
@@ -286,7 +412,7 @@ def _generate_response(prompt: str) -> str:
             # Cloudflare 当前推荐的 AI Gateway REST API 兼容 OpenAI SDK。
             # Account ID 用于构造统一端点，Gateway ID 通过请求头选择；这里
             # 不再调用 Workers AI 的 /ai/run/{model} 专用接口。
-            client = OpenAI(
+            client = sdk_client = OpenAI(
                 api_key=api_key,
                 base_url=(
                     f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
@@ -326,7 +452,7 @@ def _generate_response(prompt: str) -> str:
             # 这里在 Azure 分支内完成请求并立即返回，避免客户端被后续 fallback
             # 覆盖，导致用户配置的 Azure 凭证通过校验但实际请求没有被使用。
             logger.info(f"requesting azure chat completion, model: {model_name}")
-            client = AzureOpenAI(
+            client = sdk_client = AzureOpenAI(
                 api_key=api_key,
                 api_version=api_version,
                 azure_endpoint=base_url,
@@ -347,13 +473,134 @@ def _generate_response(prompt: str) -> str:
                     f"[{llm_provider}] returned an empty response, please check your network connection and try again."
                 )
 
+        if adapter == "claude_code":
+            # Claude 订阅（Pro / Max / Team）不签发 API Key，其凭证只能由
+            # Claude Code 官方客户端自己使用。这里不直接请求 Anthropic API，
+            # 而是以 headless 模式调用本机已登录的 claude CLI（`claude -p`），
+            # 由 CLI 完成鉴权，脚本生成只消费它返回的文本。
+            configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
+            cli_path = shutil.which(configured_cli)
+            if not cli_path and os.path.isfile(configured_cli):
+                cli_path = configured_cli
+            if not cli_path:
+                raise ValueError(
+                    f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
+                    f"install it in the runtime or set "
+                    f"{provider.config_key('cli_path')} in the config.toml file."
+                )
+
+            try:
+                timeout_seconds = coerce_claude_code_timeout(
+                    extra_values.get("timeout"), provider.config_key("timeout")
+                )
+            except ValueError as timeout_error:
+                raise ValueError(f"{llm_provider}: {timeout_error}") from None
+
+            # prompt 通过 stdin 传入，不放在命令行里：Windows 上 npm 安装的
+            # claude 是 claude.cmd，cmd.exe 会在第一个换行处截断参数，多行
+            # prompt 和其后的隔离参数都会丢失。
+            command = [
+                cli_path,
+                "-p",
+                "--output-format",
+                "json",
+                "--system-prompt",
+                CLAUDE_CODE_SYSTEM_PROMPT,
+                # 关闭全部内置工具，保证只做文本生成。
+                "--tools",
+                "",
+                # 关闭 CLAUDE.md、skills、hooks、plugins、MCP 等用户级定制；
+                # 鉴权与模型选择不受影响（不能用 --bare，它会禁用 OAuth）。
+                "--safe-mode",
+            ]
+            # 模型名留空时沿用 CLI 自己的默认模型，避免这里硬编码的模型 ID
+            # 随订阅可用模型变化而失效。
+            if model_name:
+                command += ["--model", model_name]
+
+            cli_env, removed_env = build_claude_code_env()
+            if removed_env:
+                # 只记录变量名，不记录取值，避免把密钥写进日志。
+                logger.warning(
+                    f"{llm_provider}: ignoring conflicting environment variables "
+                    f"so the subscription login is used: {', '.join(removed_env)}"
+                )
+
+            logger.info(f"invoking claude cli, model: {model_name or 'cli default'}")
+            # CLI 会读取工作目录下的 CLAUDE.md 和项目设置，这些内容会污染
+            # 文案结果，因此固定在一个临时空目录中执行。
+            with tempfile.TemporaryDirectory() as work_dir:
+                try:
+                    completed = subprocess.run(
+                        command,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        # The CLI always emits UTF-8. Without an explicit encoding,
+                        # text=True decodes with the system locale (e.g. cp1252 on
+                        # non-English Windows), so every non-ASCII character reaches
+                        # the script as mojibake.
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout_seconds,
+                        cwd=work_dir,
+                        env=cli_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli timed out after "
+                        f"{timeout_seconds:.0f}s"
+                    )
+
+            # 未登录、用量耗尽这类失败同样会返回 JSON（`is_error` 为真，
+            # `result` 是可读原因），只是退出码非 0。因此先解析 stdout，
+            # 只有在拿不到 JSON 时才回退到退出码和 stderr。
+            stdout = (completed.stdout or "").strip()
+            try:
+                payload = json.loads(stdout) if stdout else None
+            except json.JSONDecodeError:
+                payload = None
+
+            if payload is None:
+                detail = (completed.stderr or stdout or "").strip()
+                if "unknown option" in detail.lower():
+                    raise Exception(
+                        f"[{llm_provider}] the installed claude CLI does not support "
+                        f"the required isolation flags; upgrade to "
+                        f"{CLAUDE_CODE_MIN_CLI_VERSION} or newer: {detail[:300]}"
+                    )
+                if completed.returncode != 0:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli exited with code "
+                        f"{completed.returncode}: {detail[:500]}"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an invalid response: "{detail[:500]}"'
+                )
+
+            if payload.get("is_error") or completed.returncode != 0:
+                reason = str(payload.get("result") or "").strip() or (
+                    f"claude cli exited with code {completed.returncode}"
+                )
+                # 容器里无法执行交互式 /login，这里直接给出可用的鉴权方式。
+                if "login" in reason.lower():
+                    reason += (
+                        " (run `claude setup-token` on the host and pass the token "
+                        "to the container as CLAUDE_CODE_OAUTH_TOKEN)"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an error response: "{reason[:500]}"'
+                )
+
+            return _normalize_text_response(payload.get("result"), llm_provider)
+
         if adapter == "modelscope":
             content = ""
-            client = OpenAI(
+            client = sdk_client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
             )
-            response = client.chat.completions.create(
+            response = sdk_stream = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 extra_body={"enable_thinking": False},
@@ -374,7 +621,7 @@ def _generate_response(prompt: str) -> str:
             else:
                 raise Exception(f"[{llm_provider}] returned an empty response")
 
-        client = OpenAI(
+        client = sdk_client = OpenAI(
             api_key=api_key,
             base_url=base_url,
         )
@@ -397,6 +644,17 @@ def _generate_response(prompt: str) -> str:
 
     except Exception as e:
         return f"Error: {_sanitize_error_message(e)}"
+
+    finally:
+        for resource in (sdk_stream, sdk_client):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"could not close LLM transport: {type(cleanup_error).__name__}"
+                    )
 
 
 def test_connection() -> tuple[bool, str, float]:
@@ -498,6 +756,7 @@ def generate_script(
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    app_config=None,
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -527,9 +786,11 @@ def generate_script(
         response = response.replace("*", "")
         response = response.replace("#", "")
 
-        # Remove markdown syntax
-        response = re.sub(r"\[.*\]", "", response)
-        response = re.sub(r"\(.*\)", "", response)
+        # Remove markdown syntax.  Use non-greedy .*? so each bracket/paren
+        # group is removed independently; the greedy form would eat all text
+        # between the first opener and the last closer on the same line.
+        response = re.sub(r"\[.*?\]", "", response)
+        response = re.sub(r"\(.*?\)", "", response)
 
         # Split the script into paragraphs
         paragraphs = response.split("\n\n")
@@ -542,25 +803,34 @@ def generate_script(
 
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt=prompt)
+            if app_config is None:
+                response = _generate_response(prompt=prompt)
+            else:
+                response = _generate_response(prompt=prompt, app_config=app_config)
+            if isinstance(response, str) and response.startswith("Error: "):
+                # _generate_response returns provider failures as text. Passing
+                # that text through would make the task treat it as narration.
+                raise ValueError(response)
             if response:
-                final_script = format_response(response)
+                candidate = format_response(response)
             else:
                 logging.error("gpt returned an empty response")
+                candidate = ""
 
             # Some upstream providers may return quota errors as plain text.
-            if final_script and "当日额度已消耗完" in final_script:
-                raise ValueError(final_script)
+            if candidate and "当日额度已消耗完" in candidate:
+                raise ValueError(candidate)
 
-            if final_script:
+            if candidate:
+                final_script = candidate
                 break
         except Exception as e:
             logger.error(f"failed to generate script: {e}")
 
-        if i < _max_retries:
+        if i < _max_retries - 1:
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
-    if "Error: " in final_script:
-        logger.error(f"failed to generate video script: {final_script}")
+    if not final_script:
+        logger.error("failed to generate video script after retries")
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
@@ -587,7 +857,9 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
+    app_config=None,
 ) -> List[str]:
+    video_script = utils.remove_pause_tags(video_script or "").strip()
     if match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
@@ -648,8 +920,12 @@ Please note that you must use English for generating video search terms; Chinese
     search_terms = []
     response = ""
     for i in range(_max_retries):
+        search_terms = []
         try:
-            response = _generate_response(prompt)
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
             if response.startswith("Error: "):
                 # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
                 # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
@@ -658,12 +934,6 @@ Please note that you must use English for generating video search terms; Chinese
                 logger.error(f"failed to generate video terms: {response}")
                 return []
             search_terms = json.loads(_strip_code_fence(response))
-            if not isinstance(search_terms, list) or not all(
-                isinstance(term, str) for term in search_terms
-            ):
-                logger.error("response is not a list of strings.")
-                continue
-
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
             if response:
@@ -677,9 +947,17 @@ Please note that you must use English for generating video search terms; Chinese
                         # 是模型格式问题还是解析逻辑问题。
                         logger.warning(f"failed to generate video terms: {str(e)}")
 
+        # Apply the same contract to direct JSON and prose-wrapped recovery.
+        # Otherwise a nonempty array of numbers or objects reaches material search.
+        if not isinstance(search_terms, list) or not all(
+            isinstance(term, str) for term in search_terms
+        ):
+            logger.error("response is not a list of strings.")
+            search_terms = []
+
         if search_terms and len(search_terms) > 0:
             break
-        if i < _max_retries:
+        if i < _max_retries - 1:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
     logger.success(f"completed: \n{search_terms}")

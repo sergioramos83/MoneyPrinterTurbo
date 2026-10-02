@@ -42,8 +42,8 @@ class TestMaterialSearchCache(unittest.TestCase):
                 },
                 "rendition": {
                     "id": "large",
-                    "width": 1920,
-                    "height": 1080,
+                    "width": 1080,
+                    "height": 1920,
                 },
             },
         )
@@ -347,6 +347,83 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(remote_search.call_count, 1)
         self.assertEqual(first, second)
 
+    def test_search_wrapper_refreshes_mixed_orientation_cache(self):
+        """
+        升级前的缓存可能混入其它方向的素材。只返回过滤后的少量条目会降低素材
+        多样性，因此发现任意方向不匹配时应重新请求并替换整个候选集。
+        """
+        portrait_item = self._item("https://example.com/old-portrait.mp4")
+        landscape_item = self._item("https://example.com/old-landscape.mp4")
+        landscape_item.source_info["rendition"] = {
+            "id": "large",
+            "width": 1920,
+            "height": 1080,
+        }
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[portrait_item, landscape_item],
+        )
+
+        refreshed_item = self._item("https://example.com/refreshed-portrait.mp4")
+        remote_search = Mock(return_value=[refreshed_item])
+        results = material._search_videos_with_cache(
+            provider="pixabay",
+            search_videos=remote_search,
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+
+        self.assertEqual(remote_search.call_count, 1)
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/refreshed-portrait.mp4"],
+        )
+        cached_items = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        self.assertEqual(
+            [item.url for item in cached_items],
+            ["https://example.com/refreshed-portrait.mp4"],
+        )
+
+    def test_square_search_reuses_crop_compatible_cache(self):
+        """方形任务应继续复用可裁剪素材缓存，不能因原始方向不同反复请求远端。"""
+        landscape_item = self._item("https://example.com/landscape.mp4")
+        landscape_item.source_info["rendition"] = {
+            "id": "large",
+            "width": 1920,
+            "height": 1080,
+        }
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.square,
+            items=[landscape_item],
+        )
+        remote_search = Mock(return_value=[])
+
+        results = material._search_videos_with_cache(
+            provider="pixabay",
+            search_videos=remote_search,
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.square,
+        )
+
+        self.assertEqual(remote_search.call_count, 0)
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/landscape.mp4"],
+        )
+
     def test_search_wrapper_retries_after_empty_result(self):
         """空结果不缓存，下一次调用仍应访问远端，以便临时故障恢复后自动重试。"""
         remote_search = Mock(return_value=[])
@@ -514,6 +591,55 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertFalse(stale_path.exists())
         self.assertTrue(fresh_path.exists())
         self.assertTrue(unrelated_path.exists())
+
+    def test_cleanup_removes_orphaned_temp_files(self):
+        """
+        进程被强制终止时，NamedTemporaryFile(delete=False) 留下的中间文件没有
+        机会被 os.replace 消费，也不会触发异常兜底删除。它必须和过期缓存一起
+        回收，否则每次异常中断都会在缓存目录里永久累积一个残留文件。
+        """
+        orphan_path = Path(self.temp_dir.name) / (
+            f".{self._cache_path().stem}-m429jzwe.tmp"
+        )
+        orphan_path.write_text('{"version":2,"items":[]}', encoding="utf-8")
+        unrelated_path = Path(self.temp_dir.name) / "notes.tmp"
+        unrelated_path.write_text("keep", encoding="utf-8")
+
+        now = 2_000_000_000.0
+        stale_mtime = now - material_cache.MATERIAL_SEARCH_CACHE_TTL_SECONDS - 1
+        os.utime(orphan_path, (stale_mtime, stale_mtime))
+        os.utime(unrelated_path, (stale_mtime, stale_mtime))
+
+        deleted = material_cache.cleanup_expired_material_search_cache(
+            now=now,
+            force=True,
+        )
+
+        self.assertEqual(deleted, 1)
+        self.assertFalse(orphan_path.exists())
+        # 前缀不匹配的其它文件属于用户，不能被清理逻辑删除。
+        self.assertTrue(unrelated_path.exists())
+
+    def test_cleanup_keeps_recent_temp_files(self):
+        """
+        并发搜索时另一个进程可能正在写临时文件。清理必须复用缓存的过期判定，
+        让尚未超期的中间文件保持原样，避免删掉正在等待 os.replace 的文件。
+        """
+        in_flight_path = Path(self.temp_dir.name) / (
+            f".{self._cache_path().stem}-m429jzwe.tmp"
+        )
+        in_flight_path.write_text('{"version":2,"items":', encoding="utf-8")
+
+        now = 2_000_000_000.0
+        os.utime(in_flight_path, (now - 1, now - 1))
+
+        deleted = material_cache.cleanup_expired_material_search_cache(
+            now=now,
+            force=True,
+        )
+
+        self.assertEqual(deleted, 0)
+        self.assertTrue(in_flight_path.exists())
 
 
 if __name__ == "__main__":
